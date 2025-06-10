@@ -1,0 +1,22 @@
+[package]
+name = "blacksheep"
+description = "A QML shell host with services written in Rust"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+camino.workspace = true
+blacksheep-core.workspace = true
+blacksheep-qt.workspace = true
+clap.workspace = true
+cxx-qt.workspace = true
+cxx-qt-lib.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cxx-qt-build.workspace = true

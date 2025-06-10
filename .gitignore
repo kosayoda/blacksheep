@@ -1,0 +1,5 @@
+/target
+/vendor
+/.qmlls.ini
+result
+result-*

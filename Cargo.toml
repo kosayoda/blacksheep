@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/blacksheep"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Kieran Siek <git@siek.dev>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+blacksheep-core = { path = "crates/core" }
+blacksheep-dbus = { path = "crates/dbus" }
+blacksheep-desktop = { path = "crates/desktop" }
+blacksheep-niri = { path = "crates/niri" }
+blacksheep-pipewire = { path = "crates/pipewire" }
+blacksheep-qt = { path = "crates/qt" }
+blacksheep-store = { path = "crates/store" }
+
+# Qt
+cxx = "1"
+cxx-qt = "0.10"
+cxx-qt-lib = { version = "0.10", features = ["qt_gui", "qt_qml"] }
+cxx-qt-build = { version = "0.10", features = ["link_qt_object_files"] }
+
+# Async
+tokio = { version = "1", features = ["full", "time"] }
+futures-lite = "2"
+parking_lot = "0.12"
+
+# Errors and logging
+color-eyre = "0.6"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tracing = "0.1"
+tracing-error = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+
+# Services
+niri-ipc = "26.4"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
+pipewire = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+notify = "8"
+freedesktop-desktop-entry = "0.7"
+notify-debouncer-full = "0.6"
+
+# Misc
+rusqlite = { version = "0.37", features = ["bundled"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+camino = { version = "1", features = ["serde1"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+jiff = "0.1"
+paste = "1"
+libc = "0.2"
+
+# Build `backtrace` with optimizations for `color-eyre` performance
+[profile.dev.package.backtrace]
+opt-level = 3
+
+[profile.production]
+inherits = "release"
+lto = true
+strip = true

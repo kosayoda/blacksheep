@@ -1,0 +1,13 @@
+[package]
+name = "blacksheep-desktop"
+description = "Desktop entries for blacksheep"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+camino.workspace = true
+freedesktop-desktop-entry.workspace = true
+serde.workspace = true
+tracing.workspace = true

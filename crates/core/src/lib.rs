@@ -1,0 +1,35 @@
+pub use color_eyre::Result;
+pub mod exec;
+pub mod ipc;
+
+pub fn setup() -> Result<()> {
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+    // Install error report and panic hooks
+    color_eyre::install()?;
+
+    // Default logging level
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe { std::env::set_var("RUST_LOG", "info") };
+    }
+
+    let filter_layer = EnvFilter::try_from_default_env().or_else(|e| {
+        eprintln!("Invalid EnvFilter env: {e}, defaulting to info");
+        EnvFilter::try_new("info")
+    })?;
+
+    let time_format = time::format_description::parse_borrowed::<2>(
+        "[hour]:[minute]:[second].[subsecond digits:5]",
+    )?;
+    let fmt_layer = fmt::layer()
+        .compact()
+        .with_timer(fmt::time::UtcTime::new(time_format));
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .with(tracing_error::ErrorLayer::default())
+        .init();
+
+    Ok(())
+}

@@ -1,0 +1,16 @@
+[package]
+name = "blacksheep-dbus"
+description = "D-Bus backed services for blacksheep: UPower, MPRIS, notifications"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+libc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true
