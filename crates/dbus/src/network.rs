@@ -354,7 +354,7 @@ async fn watch(
         }
     };
 
-    let mut changes = {
+    let changes = {
         let rule = MatchRule::builder()
             .msg_type(MessageType::Signal)
             .interface("org.freedesktop.DBus.Properties")?
@@ -362,14 +362,40 @@ async fn watch(
             .build();
         MessageStream::for_match_rule(rule, &connection, Some(32)).await?
     };
-    let mut iwd_added = match &iwd {
-        Some(iwd) => Some(iwd.receive_interfaces_added().await?),
-        None => None,
+    // iwd's InterfacesAdded/Removed, as networks and BSSes come and go.
+    let iwd_objects = {
+        let rule = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .sender("net.connman.iwd")?
+            .path("/")?
+            .interface("org.freedesktop.DBus.ObjectManager")?
+            .build();
+        MessageStream::for_match_rule(rule, &connection, Some(32)).await?
     };
-    let mut iwd_removed = match &iwd {
-        Some(iwd) => Some(iwd.receive_interfaces_removed().await?),
-        None => None,
-    };
+    // Drain signals on their own task. zbus stops reading the socket once a
+    // stream's queue is full, so a burst (iwd roaming between access points)
+    // arriving while snapshot() waits on a method reply would wedge this
+    // watcher for good: the reply sits unread behind the signals.
+    let (wake_tx, mut wake) = mpsc::channel::<()>(1);
+    let pump = tokio::spawn(async move {
+        let mut signals = std::pin::pin!(futures_util::stream::select(changes, iwd_objects));
+        while signals.next().await.is_some() {
+            // Full means a wake-up is already pending; one snapshot covers both.
+            let _ = wake_tx.try_send(());
+        }
+    });
+    let result = watch_loop(&connection, iwd.as_ref(), updates, commands, &mut wake).await;
+    pump.abort();
+    result
+}
+
+async fn watch_loop(
+    connection: &zbus::Connection,
+    iwd: Option<&ObjectManagerProxy<'_>>,
+    updates: &mpsc::Sender<State>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    wake: &mut mpsc::Receiver<()>,
+) -> zbus::Result<()> {
     // Addresses and routes come from the kernel, which announces changes on
     // a netlink socket; no polling needed.
     let mut kernel = crate::netlink::RouteEvents::new()
@@ -377,7 +403,7 @@ async fn watch(
 
     let mut last = None;
     loop {
-        let state = snapshot(&connection, iwd.as_ref()).await?;
+        let state = snapshot(connection, iwd).await?;
         if last.as_ref() != Some(&state) {
             if updates.send(state.clone()).await.is_err() {
                 return Ok(());
@@ -385,9 +411,7 @@ async fn watch(
             last = Some(state);
         }
         tokio::select! {
-            s = changes.next() => { if s.is_none() { return Err(zbus::Error::Failure("PropertiesChanged ended".into())); } }
-            s = async { match iwd_added.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => { if s.is_none() { return Err(zbus::Error::Failure("iwd stream ended".into())); } }
-            s = async { match iwd_removed.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => { if s.is_none() { return Err(zbus::Error::Failure("iwd stream ended".into())); } }
+            s = wake.recv() => { if s.is_none() { return Err(zbus::Error::Failure("D-Bus signal stream ended".into())); } }
             changed = kernel.changed() => {
                 changed.map_err(|err| zbus::Error::Failure(format!("netlink: {err}")))?;
                 // Let the kernel finish a batch (link up, then addresses).
@@ -396,7 +420,7 @@ async fn watch(
             }
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()) };
-                if let Err(err) = perform(&connection, iwd.as_ref(), command.clone()).await {
+                if let Err(err) = perform(connection, iwd, command.clone()).await {
                     tracing::warn!("network: {command:?} failed: {err}");
                 }
             }
