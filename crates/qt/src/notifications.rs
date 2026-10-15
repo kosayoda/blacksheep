@@ -22,7 +22,7 @@ pub mod qobject {
         #[qproperty(*mut ListModel, history, READ, CONSTANT)]
         /// True while this process owns org.freedesktop.Notifications.
         #[qproperty(bool, active, READ, NOTIFY)]
-        /// Default lifetime in ms for notifications that don't set one. 0 keeps them.
+        /// Default popup lifetime in ms for notifications that don't set one. 0 keeps them.
         #[qproperty(i32, default_timeout, cxx_name = "defaultTimeout")]
         /// While set, new notifications go straight to history without a popup.
         #[qproperty(bool, do_not_disturb, cxx_name = "doNotDisturb", READ, WRITE = set_do_not_disturb, NOTIFY)]
@@ -237,8 +237,11 @@ fn apply(mut obj: Pin<&mut qobject::Notifications>, update: Update) {
             }
             obj.as_mut().remember(&notification);
             if obj.do_not_disturb {
-                // Recorded, not shown; tell the app it is gone.
-                if let Some(controller) = &obj.controller {
+                // Recorded, not shown. It stays open for the app to recall,
+                // unless there is no history row to keep it in.
+                if !obj.rows.contains_key(&notification.id)
+                    && let Some(controller) = &obj.controller
+                {
                     controller.expire(notification.id);
                 }
                 return;
@@ -252,22 +255,30 @@ fn apply(mut obj: Pin<&mut qobject::Notifications>, update: Update) {
             obj.refresh();
         }
         Update::Expire(id) => {
-            if obj.items.iter().any(|n| n.id == id)
-                && let Some(controller) = &obj.controller
-            {
+            if !obj.items.iter().any(|n| n.id == id) {
+                return;
+            }
+            if obj.rows.contains_key(&id) {
+                // Only the popup goes: the notification stays open in the
+                // centre until the user dismisses it or the app recalls it.
+                obj.as_mut().rust_mut().items.retain(|n| n.id != id);
+                obj.refresh();
+            } else if let Some(controller) = &obj.controller {
                 controller.expire(id);
             }
         }
         Update::Daemon(Event::Closed { id, .. }) => {
-            obj.as_mut().rust_mut().items.retain(|n| n.id != id);
+            let mut rust = obj.as_mut().rust_mut();
+            rust.items.retain(|n| n.id != id);
+            rust.rows.remove(&id);
             obj.refresh();
         }
     }
 }
 
-/// Expire on the server side so clients get the proper closed signal. The
-/// timer reports back here first, so an id another notification has since
-/// taken over is left alone.
+/// Take the popup down when its lifetime runs out. The timer reports back
+/// here first, so an id another notification has since taken over is left
+/// alone.
 fn schedule_expiry(obj: &Pin<&mut qobject::Notifications>, notification: &Notification) {
     let timeout = match notification.expire_timeout {
         -1 if notification.urgency >= 2 => return,
@@ -411,7 +422,17 @@ impl qobject::Notifications {
         self.refresh_history();
     }
 
+    /// Close the live notifications a history row stands for.
+    fn dismiss_row(&self, row: i64) {
+        if let Some(controller) = &self.controller {
+            for (&id, _) in self.rows.iter().filter(|(_, r)| **r == row) {
+                controller.dismiss(id);
+            }
+        }
+    }
+
     fn remove_from_history(mut self: Pin<&mut Self>, id: i64) {
+        self.dismiss_row(id);
         self.as_mut().rust_mut().records.retain(|r| r.id != id);
         if let Some(store) = blacksheep_store::global()
             && let Err(err) = store.with(|c| history::remove(c, id))
@@ -422,6 +443,11 @@ impl qobject::Notifications {
     }
 
     fn clear_history(mut self: Pin<&mut Self>) {
+        if let Some(controller) = &self.controller {
+            for &id in self.rows.keys() {
+                controller.dismiss(id);
+            }
+        }
         self.as_mut().rust_mut().records.clear();
         self.as_mut().rust_mut().rows.clear();
         if let Some(store) = blacksheep_store::global()
