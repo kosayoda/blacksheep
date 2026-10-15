@@ -235,7 +235,9 @@ fn apply(mut obj: Pin<&mut qobject::Notifications>, update: Update) {
                     controller.retire(replaced);
                 }
             }
-            obj.as_mut().remember(&notification);
+            if !notification.transient {
+                obj.as_mut().remember(&notification);
+            }
             if obj.do_not_disturb {
                 // Recorded, not shown. It stays open for the app to recall,
                 // unless there is no history row to keep it in.

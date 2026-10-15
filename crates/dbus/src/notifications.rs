@@ -39,6 +39,8 @@ pub struct Notification {
     /// `x-dunst-stack-tag` or `x-canonical-private-synchronous`: a new
     /// notification with the same app and tag replaces the earlier one.
     pub stack_tag: Option<String>,
+    /// The `transient` hint: show it, but keep it out of history.
+    pub transient: bool,
     /// How many identical notifications this one stands for. The server
     /// always sends 1; the UI raises it when it stacks duplicates.
     pub count: u32,
@@ -149,6 +151,11 @@ impl Server {
             desktop_entry: hint_string("desktop-entry"),
             stack_tag: hint_string("x-dunst-stack-tag")
                 .or_else(|| hint_string("x-canonical-private-synchronous")),
+            transient: hints.get("transient").is_some_and(|v| {
+                bool::try_from(v.clone())
+                    .or_else(|_| i32::try_from(v.clone()).map(|i| i != 0))
+                    .unwrap_or(false)
+            }),
             count: 1,
         };
         let _ = self.events.send(Event::Notified(notification)).await;
