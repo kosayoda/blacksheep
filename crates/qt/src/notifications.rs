@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Duration;
 
-use blacksheep_dbus::notifications::{self, Controller, Event, Notification};
+use blacksheep_dbus::notifications::{self, CloseReason, Controller, Event, Notification};
 use blacksheep_store::notifications::{self as history, NewRecord, Record};
 use cxx::UniquePtr;
 use cxx_qt::{CxxQtType, Threading};
@@ -267,11 +267,21 @@ fn apply(mut obj: Pin<&mut qobject::Notifications>, update: Update) {
                 controller.expire(id);
             }
         }
-        Update::Daemon(Event::Closed { id, .. }) => {
-            let mut rust = obj.as_mut().rust_mut();
-            rust.items.retain(|n| n.id != id);
-            rust.rows.remove(&id);
-            obj.refresh();
+        Update::Daemon(Event::Closed { id, reason }) => {
+            let row = {
+                let mut rust = obj.as_mut().rust_mut();
+                rust.items.retain(|n| n.id != id);
+                rust.rows.remove(&id)
+            };
+            obj.as_mut().refresh();
+            // The app took it back, e.g. once read there, so it leaves the
+            // centre too, unless another live notification shares the row.
+            if reason == CloseReason::Closed
+                && let Some(row) = row
+                && !obj.rows.values().any(|&r| r == row)
+            {
+                obj.forget(row);
+            }
         }
     }
 }
@@ -431,8 +441,13 @@ impl qobject::Notifications {
         }
     }
 
-    fn remove_from_history(mut self: Pin<&mut Self>, id: i64) {
+    fn remove_from_history(self: Pin<&mut Self>, id: i64) {
         self.dismiss_row(id);
+        self.forget(id);
+    }
+
+    /// Delete a history row, in memory and on disk.
+    fn forget(mut self: Pin<&mut Self>, id: i64) {
         self.as_mut().rust_mut().records.retain(|r| r.id != id);
         if let Some(store) = blacksheep_store::global()
             && let Err(err) = store.with(|c| history::remove(c, id))
