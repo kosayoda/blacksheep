@@ -128,6 +128,12 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX notifications_time ON notifications(notified_at DESC);",
     // 3: stacked duplicates
     "ALTER TABLE notifications ADD COLUMN count INTEGER NOT NULL DEFAULT 1;",
+    // 4: open notifications' ids, so apps can close them across restarts
+    "CREATE TABLE notification_ids (
+        live_id INTEGER PRIMARY KEY,
+        row_id  INTEGER NOT NULL REFERENCES notifications(id) ON DELETE CASCADE
+     );
+     CREATE INDEX notification_ids_row ON notification_ids(row_id);",
 ];
 
 fn migrate(connection: &Connection) -> Result<()> {

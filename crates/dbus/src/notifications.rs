@@ -5,6 +5,8 @@
 //! working alongside dunst or mako until the user switches over.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -82,7 +84,9 @@ pub enum Event {
 }
 
 struct Server {
-    next_id: u32,
+    /// The last id handed out. Shared across reconnects so an id an app
+    /// still holds is never issued again.
+    last_id: Arc<AtomicU32>,
     events: mpsc::Sender<Event>,
 }
 
@@ -119,8 +123,12 @@ impl Server {
         let id = if replaces_id != 0 {
             replaces_id
         } else {
-            self.next_id = self.next_id.wrapping_add(1).max(1);
-            self.next_id
+            loop {
+                let id = self.last_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                if id != 0 {
+                    break id;
+                }
+            }
         };
         let hint_string = |key: &str| {
             hints
@@ -223,16 +231,23 @@ impl Controller {
     }
 }
 
-pub fn start(events: mpsc::Sender<Event>) -> Controller {
+/// Serve notifications, numbering new ones from `last_id + 1`. Pass the
+/// highest id an earlier run issued, so apps still holding those ids can't
+/// close or replace a newer notification by mistake.
+pub fn start(events: mpsc::Sender<Event>, last_id: u32) -> Controller {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run(events, rx));
+    tokio::spawn(run(events, rx, Arc::new(AtomicU32::new(last_id))));
     Controller { tx }
 }
 
-async fn run(events: mpsc::Sender<Event>, mut requests: mpsc::UnboundedReceiver<Request>) {
+async fn run(
+    events: mpsc::Sender<Event>,
+    mut requests: mpsc::UnboundedReceiver<Request>,
+    last_id: Arc<AtomicU32>,
+) {
     let mut delay = crate::INITIAL_BACKOFF;
     loop {
-        match serve(&events, &mut requests).await {
+        match serve(&events, &mut requests, &last_id).await {
             Ok(()) => return,
             Err(zbus::Error::NameTaken) => {
                 tracing::info!("notifications: another daemon owns {BUS_NAME}; retrying later");
@@ -251,6 +266,7 @@ async fn run(events: mpsc::Sender<Event>, mut requests: mpsc::UnboundedReceiver<
 async fn serve(
     events: &mpsc::Sender<Event>,
     requests: &mut mpsc::UnboundedReceiver<Request>,
+    last_id: &Arc<AtomicU32>,
 ) -> zbus::Result<()> {
     let connection = zbus::connection::Builder::session()?
         .allow_name_replacements(false)
@@ -259,7 +275,7 @@ async fn serve(
         .serve_at(
             PATH,
             Server {
-                next_id: 0,
+                last_id: last_id.clone(),
                 events: events.clone(),
             },
         )?

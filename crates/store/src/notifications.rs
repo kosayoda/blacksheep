@@ -1,6 +1,10 @@
 //! Notification history: what was shown, newest first, with a read flag
 //! for the unread badge. A row updated by a repeat moves to the front, so
 //! order follows `notified_at`, not insertion.
+//!
+//! Rows standing for notifications that are still open keep the daemon's
+//! ids for them in `notification_ids`, so the app that sent one can close
+//! it after the shell restarts. Deleting a row deletes its ids.
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -115,6 +119,29 @@ pub fn clear(connection: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Record that the open notification `live_id` is shown by row `row_id`.
+pub fn bind(connection: &Connection, live_id: u32, row_id: i64) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO notification_ids (live_id, row_id) VALUES (?1, ?2)
+         ON CONFLICT(live_id) DO UPDATE SET row_id = excluded.row_id",
+        params![live_id, row_id],
+    )?;
+    Ok(())
+}
+
+/// Forget the id of a notification that has closed.
+pub fn unbind(connection: &Connection, live_id: u32) -> rusqlite::Result<()> {
+    connection.execute("DELETE FROM notification_ids WHERE live_id = ?1", params![live_id])?;
+    Ok(())
+}
+
+/// Every open notification id and the row it belongs to.
+pub fn bindings(connection: &Connection) -> rusqlite::Result<Vec<(u32, i64)>> {
+    let mut statement = connection.prepare("SELECT live_id, row_id FROM notification_ids")?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +179,30 @@ mod tests {
                 assert_eq!(recent(c, 10)?.len(), 1);
                 clear(c)?;
                 assert!(recent(c, 10)?.is_empty());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn bindings_follow_their_row() {
+        let store = crate::Store::open_in_memory().unwrap();
+        store
+            .with(|c| {
+                let first = insert(c, &record("one", 10))?;
+                let second = insert(c, &record("two", 20))?;
+                bind(c, 7, first)?;
+                bind(c, 8, first)?;
+                bind(c, 9, second)?;
+                bind(c, 8, second)?;
+                unbind(c, 9)?;
+                let mut ids = bindings(c)?;
+                ids.sort();
+                assert_eq!(ids, [(7, first), (8, second)]);
+                remove(c, first)?;
+                assert_eq!(bindings(c)?, [(8, second)]);
+                clear(c)?;
+                assert!(bindings(c)?.is_empty());
                 Ok(())
             })
             .unwrap();

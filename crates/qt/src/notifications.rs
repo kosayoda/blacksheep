@@ -102,12 +102,15 @@ const HISTORY_ROLES: &[&str] = &[
 ];
 
 const DND_KEY: &str = "notifications.doNotDisturb";
+/// The highest notification id issued, so a restart numbers on from it.
+const LAST_ID_KEY: &str = "notifications.lastId";
 /// History rows loaded at start; the table itself keeps more.
 const HISTORY_SHOWN: i64 = 200;
 
 enum Update {
     Daemon(Event),
-    History(Vec<Record>),
+    /// Stored history, and which of its rows open notifications stand for.
+    History(Vec<Record>, Vec<(u32, i64)>),
     /// A notification's lifetime ran out; it expires only if still showing.
     Expire(u32),
 }
@@ -124,8 +127,11 @@ pub struct NotificationsRust {
     _models: [UniquePtr<ListModel>; 2],
     items: Vec<Notification>,
     records: Vec<Record>,
-    /// Live notification id -> history row, so a replacement updates its row.
+    /// Live notification id -> history row, so a replacement updates its
+    /// row and a close removes it. Mirrored on disk to survive restarts.
     rows: HashMap<u32, i64>,
+    /// The highest notification id seen, as stored under `LAST_ID_KEY`.
+    last_id: u32,
     controller: Option<Controller>,
     updates: Option<tokio::sync::mpsc::Sender<Update>>,
     tasks: Vec<AbortHandle>,
@@ -141,6 +147,11 @@ impl Default for NotificationsRust {
             .and_then(|store| store.with(|c| blacksheep_store::kv::get(c, DND_KEY)).ok().flatten())
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let last_id = blacksheep_store::global()
+            .and_then(|store| store.with(|c| blacksheep_store::kv::get(c, LAST_ID_KEY)).ok().flatten())
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0);
         Self {
             notifications: live.as_mut_ptr(),
             history: history.as_mut_ptr(),
@@ -153,6 +164,7 @@ impl Default for NotificationsRust {
             items: Vec::new(),
             records: Vec::new(),
             rows: HashMap::new(),
+            last_id,
             controller: None,
             updates: None,
             tasks: Vec::new(),
@@ -174,7 +186,7 @@ impl cxx_qt::Initialize for qobject::Notifications {
 
         // Daemon events, wrapped.
         let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel::<Event>(64);
-        let controller = notifications::start(daemon_tx);
+        let controller = notifications::start(daemon_tx, self.last_id);
         let forward_tx = tx.clone();
         let relay = tokio::spawn(async move {
             while let Some(event) = daemon_rx.recv().await {
@@ -189,9 +201,12 @@ impl cxx_qt::Initialize for qobject::Notifications {
             let store = store.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                match store.run(|c| history::recent(c, HISTORY_SHOWN)).await {
-                    Ok(records) => {
-                        let _ = tx.send(Update::History(records)).await;
+                let loaded = store
+                    .run(|c| Ok((history::recent(c, HISTORY_SHOWN)?, history::bindings(c)?)))
+                    .await;
+                match loaded {
+                    Ok((records, bindings)) => {
+                        let _ = tx.send(Update::History(records, bindings)).await;
                     }
                     Err(err) => tracing::warn!("notifications: cannot load history: {err}"),
                 }
@@ -215,28 +230,27 @@ fn now() -> i64 {
 
 fn apply(mut obj: Pin<&mut qobject::Notifications>, update: Update) {
     match update {
-        Update::History(records) => {
-            obj.as_mut().rust_mut().records = records;
+        Update::History(records, bindings) => {
+            let mut rust = obj.as_mut().rust_mut();
+            rust.records = records;
+            // Ids already seen this run are newer than what was stored.
+            for (id, row) in bindings {
+                rust.rows.entry(id).or_insert(row);
+            }
             obj.refresh_history();
         }
         Update::Daemon(Event::Active(active)) => set_property!(obj, active, active),
         Update::Daemon(Event::Notified(mut notification)) => {
-            if !obj.do_not_disturb
-                && obj.stack_duplicates
-                && let Some(replaced) = obj.as_mut().stack(&mut notification)
+            let replaced = if !obj.do_not_disturb && obj.stack_duplicates {
+                obj.as_mut().stack(&mut notification)
+            } else {
+                None
+            };
+            obj.as_mut().record(&notification, replaced);
+            if let Some(replaced) = replaced
+                && let Some(controller) = &obj.controller
             {
-                // The earlier notification lives on as this one: its
-                // history row and its lifetime belong to the new id.
-                let mut rust = obj.as_mut().rust_mut();
-                if let Some(row) = rust.rows.remove(&replaced) {
-                    rust.rows.insert(notification.id, row);
-                }
-                if let Some(controller) = &rust.controller {
-                    controller.retire(replaced);
-                }
-            }
-            if !notification.transient {
-                obj.as_mut().remember(&notification);
+                controller.retire(replaced);
             }
             if obj.do_not_disturb {
                 // Recorded, not shown. It stays open for the app to recall,
@@ -270,11 +284,8 @@ fn apply(mut obj: Pin<&mut qobject::Notifications>, update: Update) {
             }
         }
         Update::Daemon(Event::Closed { id, reason }) => {
-            let row = {
-                let mut rust = obj.as_mut().rust_mut();
-                rust.items.retain(|n| n.id != id);
-                rust.rows.remove(&id)
-            };
+            obj.as_mut().rust_mut().items.retain(|n| n.id != id);
+            let row = obj.as_mut().unbind(id);
             obj.as_mut().refresh();
             // The app took it back, e.g. once read there, so it leaves the
             // centre too, unless another live notification shares the row.
@@ -343,10 +354,22 @@ impl qobject::Notifications {
         unsafe { Pin::new_unchecked(&mut *model) }.sync(&self.records);
     }
 
-    /// Write a notification to history, in memory and on disk. A repeat of
-    /// a row already there (same app and content) becomes that row again,
-    /// counted and moved to the top, rather than a new one.
-    fn remember(mut self: Pin<&mut Self>, n: &Notification) {
+    /// Persist a notification as it arrives, in one transaction: the
+    /// highest id issued, its history row unless it is transient, and its
+    /// tie to that row. `replaced` is the notification it was stacked onto,
+    /// whose row and lifetime pass to it.
+    ///
+    /// A repeat of a row already in history (same app and content) becomes
+    /// that row again, counted and moved to the top, rather than a new one.
+    fn record(mut self: Pin<&mut Self>, n: &Notification, replaced: Option<u32>) {
+        let last_id = (n.id > self.last_id).then_some(n.id);
+        let inherited = {
+            let mut rust = self.as_mut().rust_mut();
+            if let Some(id) = last_id {
+                rust.last_id = id;
+            }
+            replaced.and_then(|id| rust.rows.remove(&id))
+        };
         let mut record = NewRecord {
             notified_at: now(),
             app_name: &n.app_name,
@@ -357,7 +380,7 @@ impl qobject::Notifications {
             urgency: n.urgency,
             count: n.count,
         };
-        let existing = self.rows.get(&n.id).copied();
+        let existing = self.rows.get(&n.id).copied().or(inherited);
         let repeat = existing.is_none() && self.stack_duplicates;
         let repeat = repeat
             .then(|| {
@@ -370,24 +393,54 @@ impl qobject::Notifications {
             })
             .flatten()
             .map(|r| (r.id, r.count + 1));
-        let Some(store) = blacksheep_store::global() else {
-            return;
-        };
-        let row_id = match (existing, repeat) {
-            (Some(id), _) => store.with(|c| history::update(c, id, &record)).map(|_| id),
+        let target = match (existing, repeat) {
+            (Some(id), _) => Some(id),
             (None, Some((id, count))) => {
                 record.count = count;
-                store.with(|c| history::update(c, id, &record)).map(|_| id)
+                Some(id)
             }
-            (None, None) => store.with(|c| history::insert(c, &record)),
+            (None, None) => None,
         };
-        let row_id = match row_id {
-            Ok(id) => id,
+        let Some(store) = blacksheep_store::global() else {
+            if let Some(row) = inherited {
+                self.as_mut().rust_mut().rows.insert(n.id, row);
+            }
+            return;
+        };
+        let written = store.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            if let Some(id) = last_id {
+                blacksheep_store::kv::set(&tx, LAST_ID_KEY, &serde_json::json!(id))?;
+            }
+            if let Some(id) = replaced {
+                history::unbind(&tx, id)?;
+            }
+            let row = match (n.transient, target) {
+                (true, _) => existing,
+                (false, Some(id)) => history::update(&tx, id, &record).map(|_| Some(id))?,
+                (false, None) => Some(history::insert(&tx, &record)?),
+            };
+            if let Some(row) = row {
+                history::bind(&tx, n.id, row)?;
+            }
+            tx.commit()?;
+            Ok(row)
+        });
+        let row_id = match written {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
             Err(err) => {
-                tracing::warn!("notifications: cannot record history: {err}");
+                tracing::warn!("notifications: cannot record notification: {err}");
+                if let Some(row) = inherited {
+                    self.as_mut().rust_mut().rows.insert(n.id, row);
+                }
                 return;
             }
         };
+        self.as_mut().rust_mut().rows.insert(n.id, row_id);
+        if n.transient {
+            return;
+        }
         let full = Record {
             id: row_id,
             notified_at: record.notified_at,
@@ -402,12 +455,22 @@ impl qobject::Notifications {
         };
         {
             let mut rust = self.as_mut().rust_mut();
-            rust.rows.insert(n.id, row_id);
             rust.records.retain(|r| r.id != row_id);
             rust.records.insert(0, full);
             rust.records.truncate(HISTORY_SHOWN as usize);
         }
         self.refresh_history();
+    }
+
+    /// Drop a closed notification's tie to its row; returns the row.
+    fn unbind(mut self: Pin<&mut Self>, id: u32) -> Option<i64> {
+        let row = self.as_mut().rust_mut().rows.remove(&id)?;
+        if let Some(store) = blacksheep_store::global()
+            && let Err(err) = store.with(|c| history::unbind(c, id))
+        {
+            tracing::warn!("notifications: cannot forget closed notification: {err}");
+        }
+        Some(row)
     }
 
     fn set_do_not_disturb(mut self: Pin<&mut Self>, on: bool) {
