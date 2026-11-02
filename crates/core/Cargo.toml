@@ -7,6 +7,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blacksheep-dbus.workspace = true
 camino.workspace = true
 color-eyre.workspace = true
 serde.workspace = true

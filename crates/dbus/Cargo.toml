@@ -1,6 +1,6 @@
 [package]
 name = "blacksheep-dbus"
-description = "D-Bus backed services for blacksheep: UPower, MPRIS, notifications"
+description = "D-Bus backed services for blacksheep: UPower, MPRIS, notifications, app launches through systemd"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

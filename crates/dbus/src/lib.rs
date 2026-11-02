@@ -10,6 +10,7 @@ pub mod netlink;
 pub mod network;
 pub mod mpris;
 pub mod notifications;
+pub mod systemd;
 pub mod tray;
 pub mod upower;
 
